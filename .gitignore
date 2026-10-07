@@ -1,0 +1,7 @@
+data/
+.ipynb_checkpoints/
+__pycache__/
+.Rproj.user/
+.Rhistory
+.RData
+*.nb.html

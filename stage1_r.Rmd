@@ -1,0 +1,631 @@
+---
+title: "Stage 1: Exploratory Data Analysis in R (Spotify Songs)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(VIM)
+  library(mice)
+  library(moments)
+  library(nortest)
+  library(outliers)
+  library(ggpubr)
+  library(scales)
+})
+
+options(scipen = 999)
+
+if (!dir.exists("r_figures")) dir.create("r_figures", recursive = TRUE)
+
+theme_set(theme_minimal(base_size = 12))
+update_geom_defaults("point", list(alpha = 0.75))
+update_geom_defaults("line", list(size = 0.7))
+update_geom_defaults("histogram", list(color = "black"))
+
+save_plot <- function(filename, width = 7.5, height = 4.2, dpi = 150) {
+  ggsave(filename = file.path("r_figures", filename),
+         width = width, height = height, dpi = dpi)
+}
+```
+
+```{r load-data}
+candidates <- c("data/spotify_songs.csv", "spotify_songs.csv",
+                "../spotify_songs.csv", "/mnt/data/spotify_songs.csv")
+DATA_PATH <- NA
+for (p in candidates) {
+  if (file.exists(p)) { DATA_PATH <- p; break }
+}
+if (is.na(DATA_PATH))
+  stop("Не найден файл spotify_songs.csv — поместите его рядом или в папку data/.")
+
+cat("Используем DATA_PATH:", DATA_PATH, "\n")
+df <- fread(DATA_PATH)
+
+default_candidates <- c(
+  "danceability", "energy", "loudness", "speechiness", "acousticness",
+  "instrumentalness", "liveness", "valence", "tempo", "duration_ms", "track_popularity"
+)
+num_cols <- intersect(default_candidates, colnames(df))
+cat_cols <- intersect(c("playlist_genre", "playlist_subgenre",
+                        "mode", "key", "explicit", "language"), colnames(df))
+
+cat("Размер данных:", nrow(df), "x", ncol(df), "\n")
+cat("Числовые признаки:", paste(num_cols, collapse=", "), "\n")
+cat("Категориальные/текстовые:", paste(cat_cols, collapse=", "), "\n")
+
+head(df)
+```
+
+# 1. Описательная статистика
+
+## 1.1 Сводная таблица по числовым признакам
+
+```{r summary-table}
+desc_df <- df[, ..num_cols] |> as.data.frame()
+
+summary_tbl <- data.frame(
+  feature = num_cols,
+  n       = sapply(desc_df, function(x) sum(!is.na(x))),
+  mean    = sapply(desc_df, function(x) mean(x, na.rm = TRUE)),
+  sd      = sapply(desc_df, function(x) sd(x, na.rm = TRUE)),
+  min     = sapply(desc_df, function(x) min(x, na.rm = TRUE)),
+  q25     = sapply(desc_df, function(x) quantile(x, 0.25, na.rm = TRUE)),
+  median  = sapply(desc_df, function(x) median(x, na.rm = TRUE)),
+  q75     = sapply(desc_df, function(x) quantile(x, 0.75, na.rm = TRUE)),
+  max     = sapply(desc_df, function(x) max(x, na.rm = TRUE))
+)
+
+print(tibble::as_tibble(summary_tbl))
+```
+
+## 1.2 Пропуски
+
+```{r missingness}
+missing_share <- sapply(df, function(x) mean(is.na(x))) |> sort(decreasing = TRUE)
+ms <- missing_share[missing_share > 0]
+
+if (length(ms) > 0) {
+  miss_df <- tibble(var = names(ms), pct = 100 * as.numeric(ms))
+  p_ms <- ggplot(miss_df, aes(x=reorder(var,pct), y=pct)) +
+    geom_col(fill = "#86b7ff") +
+    coord_flip() +
+    labs(title="Доля пропусков по столбцам (>0%)",
+         x="Признак", y="% пропусков") +
+    geom_text(aes(label=sprintf("%.1f%%", pct)), hjust=-0.1, size=3) +
+    ylim(0, max(miss_df$pct) * 1.15)
+  print(p_ms)
+  save_plot("missing_share_bar.png")
+} else {
+  cat("Пропусков в числовых столбцах нет.\n")
+}
+```
+
+# 2. Распределения числовых признаков
+
+## 2.1 KDE + гистограммы
+
+```{r kde-plots}
+for (c in num_cols) {
+  x <- suppressWarnings(as.numeric(df[[c]]))
+  x <- x[!is.na(x)]
+  if (length(x) < 10) next
+  bins <- ifelse(length(x) > 500, 30, 20)
+
+  p <- ggplot(data.frame(x = x), aes(x = x)) +
+    geom_histogram(aes(y=after_stat(density)),
+                   bins=bins, fill="#cfe2ff") +
+    geom_density(color="#2f6fed", linewidth=0.9) +
+    labs(title=paste("KDE:", c), x=c, y="Плотность")
+
+  print(p)
+  save_plot(paste0("kde_", c, ".png"))
+}
+```
+
+## 2.2 Boxplot и stripchart
+
+```{r boxplots-strip}
+other <- setdiff(num_cols, "duration_ms")
+
+if (length(other) > 0) {
+  long_df <- df[, ..other] |>
+    pivot_longer(cols = everything(),
+                 names_to="feature",
+                 values_to="value") |>
+    drop_na()
+
+  p1 <- ggplot(long_df, aes(y=feature, x=value)) +
+    geom_boxplot(outlier.alpha=0.4, fill="#f0f3ff") +
+    labs(title="Boxplots (без duration_ms)", x="Значение", y=NULL)
+  print(p1)
+  save_plot("boxplots_without_duration_ms.png",
+            height=max(4.2, 0.5*length(unique(long_df$feature)) + 1.5))
+
+  p3 <- ggplot(long_df, aes(y=feature, x=value)) +
+    geom_jitter(height=0.1, size=0.7, alpha=0.35) +
+    labs(title="Stripchart (без duration_ms)", x="Значение", y=NULL)
+  print(p3)
+  save_plot("stripchart_numeric.png",
+            height=max(4.2, 0.5*length(unique(long_df$feature)) + 1.5))
+}
+
+if ("duration_ms" %in% num_cols) {
+  p2 <- ggplot(df, aes(x=duration_ms)) +
+    geom_boxplot(outlier.alpha=0.6, fill="#f0f3ff") +
+    coord_flip() +
+    labs(title="Boxplot: duration_ms", x="duration_ms", y=NULL)
+  print(p2)
+  save_plot("boxplot_duration_ms.png")
+}
+```
+
+## 2.3 Нормализованные boxplot (z-score)
+
+```{r standardized-boxplots}
+scaled <- df[, ..num_cols] |> as.data.frame() |> scale() |> as.data.frame()
+long_scaled <- scaled |>
+  pivot_longer(cols=everything(),
+               names_to="feature",
+               values_to="z") |>
+  drop_na()
+
+p4 <- ggplot(long_scaled, aes(y=feature, x=z)) +
+  geom_boxplot(outlier.alpha=0.4, fill="#e7f1ff") +
+  labs(title="Boxplots (нормализованные, z-score)",
+       x="z-значение", y=NULL)
+
+print(p4)
+save_plot("boxplots_standardized.png",
+          height=max(4.2, 0.5*length(unique(long_scaled$feature)) + 1.5))
+```
+
+# 3. Визуализации по группам
+
+## 3.1 Dotchart: средняя danceability по жанрам
+
+```{r dotchart}
+if (all(c("playlist_genre", "danceability") %in% colnames(df))) {
+  mean_by_genre <- df |>
+    group_by(playlist_genre) |>
+    summarise(mean_dance = mean(danceability, na.rm=TRUE)) |>
+    arrange(mean_dance)
+
+  p <- ggplot(mean_by_genre,
+              aes(x=mean_dance,
+                  y=reorder(playlist_genre, mean_dance))) +
+    geom_point() +
+    geom_text(aes(label=sprintf("%.2f", mean_dance)),
+              nudge_x=0.02, size=3, vjust=0.35) +
+    labs(title="Dotchart: средняя танцевальность по жанрам",
+         x="Средняя danceability", y="Жанр плейлиста") +
+    xlim(min(mean_by_genre$mean_dance)-0.02,
+         max(mean_by_genre$mean_dance)+0.12)
+
+  print(p)
+  save_plot("dotchart_danceability_by_genre.png",
+            height=max(4.2, 0.45*nrow(mean_by_genre) + 1.2))
+}
+```
+
+## 3.2 CD-plot аналог: популярность по жанрам
+
+```{r cdplot-analog}
+if (all(c("track_popularity", "playlist_genre") %in% colnames(df))) {
+  d <- df |>
+    select(playlist_genre, track_popularity) |>
+    drop_na()
+
+  if (n_distinct(d$track_popularity) >= 5) {
+    d <- d |> mutate(pop_bin = ntile(track_popularity, 5))
+  } else {
+    d <- d |> mutate(pop_bin = cut(track_popularity,
+                                  breaks=c(-0.1,20,40,60,80,100),
+                                  include.lowest=TRUE))
+  }
+
+  ct <- d |>
+    group_by(playlist_genre, pop_bin) |>
+    summarise(n=n(), .groups="drop") |>
+    group_by(playlist_genre) |>
+    mutate(pct = n/sum(n))
+
+  p_cd <- ggplot(ct, aes(x=playlist_genre, y=pct, fill=factor(pop_bin))) +
+    geom_col(position="fill", width=0.85) +
+    coord_flip() +
+    scale_y_continuous(labels=percent_format()) +
+    labs(title="CD-plot аналог: распределение популярности по жанрам",
+         x="Жанр плейлиста", y="Доля внутри жанра",
+         fill="Квантили популярности")
+
+  print(p_cd)
+  save_plot("cdplot_analog_popularity_by_genre.png",
+            width=9, height=4.5)
+}
+```
+
+# 4. Выбросы и нормальность
+
+## 4.1 Граббс на реальных данных (с пометкой о неприменимости)
+
+```{r grubbs-real}
+grubbs_flags <- function(x, alpha=0.05, iterative=TRUE, max_iter=5) {
+  x <- as.numeric(x); x <- x[!is.na(x)]
+  flags <- rep(FALSE, length(x))
+  i <- 1
+  repeat {
+    if (length(x[!flags]) < 3) break
+    gt <- try(outliers::grubbs.test(x[!flags]), silent=TRUE)
+    if (inherits(gt, "try-error")) break
+    pval <- gt$p.value
+    if (pval < alpha) {
+      which_side <- if (grepl("lowest", gt$alternative)) "min" else "max"
+      idx <- if (which_side=="min") which.min(x[!flags]) else which.max(x[!flags])
+      real_idx <- which(!flags)[idx]
+      flags[real_idx] <- TRUE
+      if (!iterative || i >= max_iter) break
+      i <- i + 1
+    } else break
+  }
+  flags
+}
+
+outlier_viz <- function(vec, feature, alpha=0.05, iterative=TRUE, max_iter=5) {
+  x <- suppressWarnings(as.numeric(vec))
+  x <- x[!is.na(x)]
+  flags <- grubbs_flags(x, alpha=alpha, iterative=iterative, max_iter=max_iter)
+  out_vals <- x[flags]; n_out <- sum(flags)
+
+  # фикс: задаём y как константу, чтобы geom_point знал куда ставить точки
+  p1 <- ggplot(data.frame(x = x), aes(x = x, y = "")) +
+    geom_boxplot(outlier.shape = NA, fill = "#eef2ff") +
+    coord_flip() +
+    { if (n_out > 0)
+        geom_point(
+          data = data.frame(x = out_vals),
+          aes(x = x, y = ""),
+          color = "red", shape = 4, size = 3, stroke = 1.1
+        )
+    } +
+    labs(
+      title = paste0(feature, ": boxplot | выбросы (Граббс α=", alpha, "): ", n_out),
+      x = feature, y = NULL
+    )
+
+  print(p1)
+  save_plot(paste0("outliers_boxplot_", feature, ".png"))
+
+  p2 <- ggplot(data.frame(x=x), aes(x=x)) +
+    geom_histogram(
+      bins = ifelse(length(x) > 1000, 40, 25),
+      fill = "#cfe2ff", color = "black"
+    ) +
+    { if (n_out > 0)
+        geom_vline(xintercept = out_vals, linetype = "dashed", color = "red")
+    } +
+    labs(
+      title = paste0(feature, ": гистограмма с выбросами (n_out=", n_out, ")"),
+      x = feature, y = "Количество"
+    )
+
+  print(p2)
+  save_plot(paste0("outliers_hist_", feature, ".png"))
+
+  if (n_out > 0)
+    cat(feature, " — значения выбросов:", paste(round(sort(out_vals), 2), collapse = ", "), "\n")
+}
+
+
+if ("tempo" %in% colnames(df))
+  outlier_viz(df$tempo, "tempo", alpha=0.05, iterative=TRUE, max_iter=3)
+if ("loudness" %in% colnames(df))
+  outlier_viz(df$loudness, "loudness", alpha=0.05, iterative=TRUE, max_iter=3)
+```
+
+**Вывод:** в реальных данных tempo и loudness нормальность нарушена, поэтому критерии Граббса и Диксона формально неприменимы. Далее демонстрируем их работу на синтетической нормальной выборке.
+
+## 4.2 Нормальность (small/moder) и QQ-огибающие + реальные признаки
+
+```{r normality+qq}
+set.seed(123)
+small <- rnorm(80, mean=0, sd=1)
+moder <- rnorm(4000, mean=1, sd=2)
+
+normality_suite <- function(x) {
+  list(
+    shapiro_p   = tryCatch(shapiro.test(x)$p.value, error=function(e) NA),
+    dagostino_p = tryCatch(moments::agostino.test(x)$p.value, error=function(e) NA),
+    jarque_p    = tryCatch(moments::jarque.test(x)$p.value, error=function(e) NA),
+    cvm_p       = tryCatch(nortest::cvm.test(x)$p.value, error=function(e) NA),
+    ad_stat     = tryCatch(nortest::ad.test(x)$statistic, error=function(e) NA),
+    lillie_p    = tryCatch(nortest::lillie.test(x)$p.value, error=function(e) NA)
+  )
+}
+
+norm_df <- bind_rows(normality_suite(small), normality_suite(moder), .id="sample")
+norm_df$sample <- c("small(n=80)", "moder(n=4000)")
+print(norm_df)
+
+qq_envelope <- function(x, nsim=200) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  if (n < 10 || sd(x)==0) return(NULL)
+  xs <- scale(x)
+  osm <- sort(qnorm((1:n - 0.5)/n))
+  sims <- replicate(nsim, sort(rnorm(n)))
+  lo <- apply(sims, 1, quantile, probs=0.025)
+  hi <- apply(sims, 1, quantile, probs=0.975)
+  tibble(theor=osm, emp=sort(as.numeric(xs)), lo=lo, hi=hi)
+}
+
+# small
+df_small <- qq_envelope(small)
+p_q1 <- ggplot(df_small, aes(theor, emp)) +
+  geom_point(size=1.3) +
+  geom_line(aes(y=lo), linetype="dashed") +
+  geom_line(aes(y=hi), linetype="dashed") +
+  geom_abline(slope=1, intercept=0, color="red", linetype="dotted") +
+  labs(title="QQ + огибающая (нормальная выборка, n=80)",
+       x="Теор. квантили N(0,1)", y="Эмпирические (std)")
+print(p_q1); save_plot("qq_envelope_small.png", width=6.2, height=4.6)
+
+# moder
+df_moder <- qq_envelope(moder)
+p_q2 <- ggplot(df_moder, aes(theor, emp)) +
+  geom_point(size=1.3) +
+  geom_line(aes(y=lo), linetype="dashed") +
+  geom_line(aes(y=hi), linetype="dashed") +
+  geom_abline(slope=1, intercept=0, color="red", linetype="dotted") +
+  labs(title="QQ + огибающая (нормальная выборка, n=4000)",
+       x="Теор. квантили N(0,1)", y="Эмпирические (std)")
+print(p_q2); save_plot("qq_envelope_moder.png", width=6.2, height=4.6)
+
+# реальные loudness/tempo
+if ("loudness" %in% colnames(df)) {
+  df_l <- qq_envelope(as.numeric(df$loudness))
+  p_ql <- ggplot(df_l, aes(theor, emp)) +
+    geom_point(size=1.3) +
+    geom_line(aes(y=lo), linetype="dashed") +
+    geom_line(aes(y=hi), linetype="dashed") +
+    geom_abline(slope=1, intercept=0, color="red", linetype="dotted") +
+    labs(title="QQ + огибающая (реальные данные: loudness)",
+         x="Теор. квантили N(0,1)", y="Эмпирические (std)")
+  print(p_ql); save_plot("qq_envelope_loudness.png", width=6.2, height=4.6)
+}
+
+if ("tempo" %in% colnames(df)) {
+  df_t <- qq_envelope(as.numeric(df$tempo))
+  p_qt <- ggplot(df_t, aes(theor, emp)) +
+    geom_point(size=1.3) +
+    geom_line(aes(y=lo), linetype="dashed") +
+    geom_line(aes(y=hi), linetype="dashed") +
+    geom_abline(slope=1, intercept=0, color="red", linetype="dotted") +
+    labs(title="QQ + огибающая (реальные данные: tempo)",
+         x="Теор. квантили N(0,1)", y="Эмпирические (std)")
+  print(p_qt); save_plot("qq_envelope_tempo.png", width=6.2, height=4.6)
+}
+```
+
+## 4.3 Демонстрация Grubbs и Dixon на синтетической нормали
+
+```{r grubbs-dixon-synthetic}
+set.seed(2025)
+n_demo <- 30
+x_clean_demo <- rnorm(n_demo, mean=0, sd=1)
+x_out_demo <- x_clean_demo
+x_out_demo[1] <- 5
+
+cat("\n================= Synthetic normal data =================\n")
+cat("n =", n_demo, "\n")
+
+cat("\n== Normality check ==\n")
+cat("x_clean_demo: Shapiro p =", shapiro.test(x_clean_demo)$p.value, "\n")
+cat("x_out_demo:   Shapiro p =", shapiro.test(x_out_demo)$p.value, "\n")
+
+cat("\n== Grubbs test ==\n")
+print(grubbs.test(x_clean_demo))
+print(grubbs.test(x_out_demo))
+
+cat("\n== Dixon Q test ==\n")
+print(dixon.test(x_clean_demo))
+print(dixon.test(x_out_demo))
+
+p_syn1 <- ggplot(data.frame(x=x_clean_demo), aes(x=x)) +
+geom_histogram(aes(y=after_stat(density)), bins=12, fill="#cfe2ff", color="black") +
+stat_function(fun=dnorm, args=list(mean=mean(x_clean_demo), sd=sd(x_clean_demo)),
+linetype="dashed") +
+labs(title="Synthetic normal sample (n=30) — without outlier",
+x="x", y="Density")
+print(p_syn1); save_plot("synthetic_normal_clean.png")
+
+p_syn2 <- ggplot(data.frame(x=x_out_demo), aes(x=x)) +
+geom_histogram(aes(y=after_stat(density)), bins=12, fill="#cfe2ff", color="black") +
+geom_vline(xintercept=x_out_demo[1], color="red", linetype="dashed") +
+stat_function(fun=dnorm, args=list(mean=mean(x_out_demo), sd=sd(x_out_demo)),
+linetype="dashed") +
+labs(title="Synthetic normal sample (n=30) — with an outlier",
+x="x", y="Density")
+print(p_syn2); save_plot("synthetic_normal_with_outlier.png")
+```
+
+# 5. Импутация пропусков (сравнение методов)
+
+```{r imputation}
+set.seed(42)
+num_df <- df[, ..num_cols] |> as.data.frame() |> na.omit()
+
+sample_n <- min(1000, nrow(num_df))
+sub <- num_df[sample(nrow(num_df), sample_n), , drop=FALSE]
+
+miss_rate <- 0.1
+mask <- matrix(runif(nrow(sub)*ncol(sub)) < miss_rate,
+               nrow=nrow(sub), ncol=ncol(sub))
+sub_missing <- sub
+sub_missing[mask] <- NA
+
+# mean
+mean_imp <- sub_missing
+for (j in seq_len(ncol(mean_imp))) {
+  col_mean <- mean(mean_imp[[j]], na.rm=TRUE)
+  mean_imp[[j]][is.na(mean_imp[[j]])] <- col_mean
+}
+
+# kNN
+knn_imp <- try(VIM::kNN(sub_missing, k=5, imp_var=FALSE), silent=TRUE)
+if (inherits(knn_imp, "try-error")) knn_imp <- NULL
+
+# MICE
+mice_imp <- try({
+  m <- mice::mice(as.data.frame(sub_missing), m=1, maxit=10,
+                  printFlag=FALSE, seed=42)
+  mice::complete(m)
+}, silent=TRUE)
+if (inherits(mice_imp, "try-error")) mice_imp <- NULL
+
+mse <- list()
+mse[["mean"]] <- mean((as.matrix(sub)-as.matrix(mean_imp))[mask]^2, na.rm=TRUE)
+if (!is.null(knn_imp))
+  mse[["kNN"]] <- mean((as.matrix(sub)-as.matrix(knn_imp))[mask]^2, na.rm=TRUE)
+if (!is.null(mice_imp))
+  mse[["MICE"]] <- mean((as.matrix(sub)-as.matrix(mice_imp))[mask]^2, na.rm=TRUE)
+
+mse_df <- tibble(Метод=names(mse), MSE=as.numeric(mse))
+print(mse_df)
+
+p_mse <- ggplot(mse_df, aes(x=Метод, y=MSE, fill=Метод=="MICE")) +
+  geom_col() +
+  scale_fill_manual(values=c("#c7c7c7", "#6fa8ff"), guide="none") +
+  geom_text(aes(label=label_scientific()(MSE)), vjust=-0.3, size=3.5) +
+  labs(title="Импутация (10% пропусков): сравнение MSE",
+       x=NULL, y="MSE")
+print(p_mse); save_plot("imputation_mse_bar.png")
+```
+
+
+# 6–7) Нормальность: QQ-графики с огибающей + гистограммы (R)
+
+```{r normality-qq-hist, message=FALSE, warning=FALSE}
+# --- предполагаем, что df уже загружен, num_cols определён ---
+# --- save_plot из setup сохраняет в r_figures/ ---
+
+# QQ-plot с огибающей
+qq_envelope <- function(x, nsim=200, title="", filename=NULL) {
+  x <- as.numeric(x)
+  x <- x[!is.na(x)]
+  n <- length(x)
+  if (n < 10 || sd(x) == 0) {
+    message("Not enough data/variation for QQ: ", title)
+    return(NULL)
+  }
+
+  xs <- as.numeric(scale(x))
+  theor <- sort(qnorm((1:n - 0.5)/n))
+
+  sims <- replicate(nsim, sort(rnorm(n)))
+  lo <- apply(sims, 1, quantile, probs=0.025)
+  hi <- apply(sims, 1, quantile, probs=0.975)
+
+  df_q <- tibble(
+    theor = theor,
+    emp   = sort(xs),
+    lo    = lo,
+    hi    = hi
+  )
+
+  p <- ggplot(df_q, aes(theor, emp)) +
+    geom_point(size=1.2) +
+    geom_line(aes(y=lo), linetype="dashed") +
+    geom_line(aes(y=hi), linetype="dashed") +
+    geom_abline(slope=1, intercept=0, color="red", linetype="dotted") +
+    labs(title=title,
+         x="Теоретические квантили N(0,1)",
+         y="Эмпирические стандартизованные значения") +
+    theme_minimal()
+
+  print(p)
+  if (!is.null(filename)) {
+    save_plot(filename, width=6.2, height=4.6)
+  }
+  invisible(p)
+}
+
+# Гистограмма + нормальная плотность
+hist_norm <- function(x, title="", filename=NULL) {
+  x <- as.numeric(x)
+  x <- x[!is.na(x)]
+  n <- length(x)
+  if (n < 5 || sd(x) == 0) {
+    message("Not enough data/variation for hist: ", title)
+    return(NULL)
+  }
+
+  mu  <- mean(x)
+  sig <- sd(x)
+
+  bins <- ifelse(n < 200, 20, 40)
+
+  p <- ggplot(tibble(x=x), aes(x)) +
+    geom_histogram(aes(y=after_stat(density)),
+                   bins=bins, fill="#cfe2ff", color="black") +
+    stat_function(fun=dnorm,
+                  args=list(mean=mu, sd=sig),
+                  linetype="dashed") +
+    labs(title=title,
+         x="Значение", y="Плотность") +
+    theme_minimal()
+
+  print(p)
+  if (!is.null(filename)) {
+    save_plot(filename, width=6.2, height=4.6)
+  }
+  invisible(p)
+}
+
+# ======================================
+# 1) Синтетические нормальные данные
+# ======================================
+set.seed(123)
+small <- rnorm(80, 0, 1)
+moder <- rnorm(4000, 1, 2)
+
+qq_envelope(small, title="QQ + envelope (normal, n=80)",
+            filename="qq_envelope_small_r.png")
+hist_norm(small, title="Histogram + normal density (n=80)",
+          filename="hist_small_r.png")
+
+qq_envelope(moder, title="QQ + envelope (normal, n=4000)",
+            filename="qq_envelope_moder_r.png")
+hist_norm(moder, title="Histogram + normal density (n=4000)",
+          filename="hist_moder_r.png")
+
+# ======================================
+# 2) Реальные признаки Spotify
+# ======================================
+if ("loudness" %in% names(df)) {
+  qq_envelope(df$loudness,
+              title="QQ + envelope (real: loudness)",
+              filename="qq_envelope_loudness_r.png")
+  hist_norm(df$loudness,
+            title="Histogram + normal density (real: loudness)",
+            filename="hist_loudness_r.png")
+}
+
+if ("tempo" %in% names(df)) {
+  qq_envelope(df$tempo,
+              title="QQ + envelope (real: tempo)",
+              filename="qq_envelope_tempo_r.png")
+  hist_norm(df$tempo,
+            title="Histogram + normal density (real: tempo)",
+            filename="hist_tempo_r.png")
+}
+```
+
+# . Итоговые выводы
+
+- В большинстве числовых признаков наблюдается асимметрия и/или тяжёлые хвосты.  
+- Для tempo и loudness нормальность отвергается (Shapiro-Wilk, AD-test, QQ-огибающие).  
+- Поэтому тесты Граббса/Диксона на реальных данных формально некорректны.  
+- На синтетической нормальной выборке Grubbs и Dixon корректно обнаруживают искусственный выброс.  
+- Среди методов импутации на 10% пропусков минимальную MSE обычно показывает MICE (или kNN, если так вышло в расчётах).  

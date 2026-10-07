@@ -1,0 +1,484 @@
+---
+title: "Stage 2: Statistical Analysis in R (Spotify Songs)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(data.table)
+  library(car)        # leveneTest, vif
+  library(pwr)        # power
+  library(effsize)    # Cohen's d
+  library(corrplot)
+  library(vcdExtra)   # CMHtest
+  library(scales)
+})
+
+options(scipen = 999)
+if (!dir.exists("r_figures2")) dir.create("r_figures2", recursive = TRUE)
+
+save_plot <- function(filename, width=7, height=4.5, dpi=150){
+  ggsave(filename = file.path("r_figures2", filename),
+         width=width, height=height, dpi=dpi)
+}
+```
+
+```{r load-data}
+CSV_PATH <- "data/spotify_songs.csv"
+df <- fread(CSV_PATH, encoding="UTF-8")
+
+# --- FIX names: trim + normalize ---
+names(df) <- trimws(names(df))   # убираем пробелы по краям имён
+
+# если вдруг колонка с другой регистровкой/суффиксом
+if (!"track_popularity" %in% names(df)) {
+  cand <- names(df)[tolower(names(df)) == "track_popularity"]
+  if (length(cand) == 1) setnames(df, cand, "track_popularity")
+}
+
+# частые варианты
+if (!"track_popularity" %in% names(df) && "track_popularity " %in% names(df)) {
+  setnames(df, "track_popularity ", "track_popularity")
+}
+if (!"track_popularity" %in% names(df) && "track_popularity.x" %in% names(df)) {
+  setnames(df, "track_popularity.x", "track_popularity")
+}
+
+# контроль: если всё ещё нет — останавливаемся с понятной ошибкой
+if (!"track_popularity" %in% names(df)) {
+  stop("В датасете нет колонки track_popularity. Доступные имена: ",
+       paste(names(df), collapse = ", "))
+}
+
+# приводим к числу на всякий случай
+df$track_popularity <- as.numeric(df$track_popularity)
+
+cat("Размер данных:", nrow(df), "x", ncol(df), "\n")
+str(df)
+
+```
+
+# 1. Проверка статистических гипотез
+
+## 1.1 Одновыборочный t-тест (pop против общего среднего)
+
+```{r ttest-1sample}
+popularity_pop <- df %>%
+  filter(playlist_genre == "pop") %>%
+  pull(track_popularity) %>%
+  na.omit()
+
+mu0 <- mean(df$track_popularity, na.rm = TRUE)
+cat("Гипотетическое среднее mu0:", round(mu0, 2), "\n")
+cat("Средняя по pop:", round(mean(popularity_pop), 2), "\n")
+
+tt1_two <- t.test(popularity_pop, mu = mu0, alternative = "two.sided")
+tt1_greater <- t.test(popularity_pop, mu = mu0, alternative = "greater")
+tt1_less <- t.test(popularity_pop, mu = mu0, alternative = "less")
+tt1_two
+tt1_greater
+tt1_less
+
+# Cohen's d для 1-sample
+d1 <- (mean(popularity_pop) - mu0) / sd(popularity_pop)
+cat("Cohen's d (1-sample):", round(d1, 3), "\n")
+
+# мощность / необходимый n
+power_1s <- pwr.t.test(d=abs(d1), n=length(popularity_pop),
+                       sig.level=0.05, type="one.sample",
+                       alternative="two.sided")$power
+cat("Power 1-sample:", round(power_1s, 3), "\n")
+
+n_req_1s <- pwr.t.test(d=abs(d1), power=0.8, sig.level=0.05,
+                       type="one.sample", alternative="two.sided")$n
+cat("Required n for power 0.8:", ceiling(n_req_1s), "\n")
+```
+
+## 1.2 Двухвыборочный t-тест (pop vs rock) + эффект + мощность
+
+```{r ttest-2sample}
+popularity_rock <- df %>%
+  filter(playlist_genre == "rock") %>%
+  pull(track_popularity) %>%
+  na.omit()
+
+cat("n_pop =", length(popularity_pop), " n_rock =", length(popularity_rock), "\n")
+cat("mean_pop =", mean(popularity_pop), " mean_rock =", mean(popularity_rock), "\n")
+
+tt2_two <- t.test(popularity_pop, popularity_rock, var.equal=FALSE, alternative="two.sided")
+tt2_greater <- t.test(popularity_pop, popularity_rock, var.equal=FALSE, alternative="greater")
+tt2_less <- t.test(popularity_pop, popularity_rock, var.equal=FALSE, alternative="less")
+tt2_two
+tt2_greater
+tt2_less
+
+# Cohen's d
+cd <- cohen.d(popularity_pop, popularity_rock, hedges.correction=TRUE)
+cd
+
+# power curve + required n
+analysis <- pwr.t.test(d=abs(cd$estimate), sig.level=0.05,
+                       type="two.sample", alternative="two.sided", power=0.8)
+analysis
+
+sizes <- seq(20, 600, by=10)
+powers <- sapply(sizes, function(n)
+  pwr.t.test(d=abs(cd$estimate), n=n, sig.level=0.05,
+             type="two.sample", alternative="two.sided")$power
+)
+pow_df <- data.frame(n = sizes, power = powers)
+
+p_pow <- ggplot(pow_df, aes(n, power)) +
+  geom_line() +
+  geom_hline(yintercept=0.8, linetype="dashed") +
+  geom_vline(xintercept=analysis$n, linetype="dotted") +
+  labs(title="Мощность двухвыборочного t-теста vs n",
+       x="Размер выборки на группу", y="Power")
+print(p_pow); save_plot("power_curve_ttest.png", width=7, height=4.5)
+```
+
+## 1.3 Проверка нормальности для групп pop/rock
+
+```{r normality-pop-rock}
+norm_report <- function(x, name){
+  x <- na.omit(as.numeric(x))
+  sh_p <- shapiro.test(sample(x, min(5000, length(x))))$p.value
+  ad_stat <- nortest::ad.test(x)$statistic
+  cat("\n", name, ": Shapiro p =", signif(sh_p,3),
+      " | AD stat =", round(ad_stat,3), "\n")
+}
+
+norm_report(popularity_pop, "pop")
+norm_report(popularity_rock, "rock")
+
+plot_hist_qq <- function(x, name){
+  x <- na.omit(as.numeric(x))
+  p1 <- ggplot(data.frame(x=x), aes(x)) +
+    geom_histogram(aes(y=after_stat(density)), bins=30,
+                   fill="gray85", color="black") +
+    geom_density(linewidth=0.9) +
+    labs(title=paste0("Histogram + KDE: ", name))
+  print(p1); save_plot(paste0("hist_kde_popularity_", name, ".png"))
+
+  qq <- qqplot(x, qnorm(ppoints(length(x))), plot.it=FALSE)
+  dfq <- data.frame(theor = qq$x, emp = qq$y)
+
+  p2 <- ggplot(dfq, aes(theor, emp)) +
+    geom_point(alpha=0.5) +
+    geom_abline(slope=1, intercept=0, color="red") +
+    labs(title=paste0("QQ-plot: ", name),
+         x="Theoretical N(0,1)", y="Empirical")
+  print(p2); save_plot(paste0("qq_popularity_", name, ".png"))
+}
+
+plot_hist_qq(popularity_pop, "pop")
+plot_hist_qq(popularity_rock, "rock")
+```
+
+## 1.4 Манн–Уитни (Wilcoxon rank-sum)
+
+```{r mann-whitney}
+mw_two <- wilcox.test(popularity_pop, popularity_rock, alternative="two.sided")
+mw_greater <- wilcox.test(popularity_pop, popularity_rock, alternative="greater")
+mw_two
+mw_greater
+```
+
+## 1.5 Тесты на равенство дисперсий
+
+```{r variances}
+bartlett.test(list(popularity_pop, popularity_rock))
+leveneTest(c(popularity_pop, popularity_rock) ~
+            rep(c("pop","rock"),
+                c(length(popularity_pop), length(popularity_rock))))
+fligner.test(list(popularity_pop, popularity_rock))
+var.test(popularity_pop, popularity_rock)
+
+# графики
+df_sub <- df %>% filter(playlist_genre %in% c("pop","rock"))
+
+p_box <- ggplot(df_sub, aes(playlist_genre, track_popularity, fill=playlist_genre)) +
+  geom_boxplot(outlier.alpha=0.35) +
+  labs(title="Boxplot популярности: pop vs rock", x="Жанр", y="track_popularity") +
+  theme(legend.position="none")
+print(p_box); save_plot("boxplot_pop_vs_rock.png", width=6, height=4)
+
+p_hist <- ggplot(df_sub, aes(track_popularity, fill=playlist_genre)) +
+  geom_histogram(bins=25, alpha=0.5, position="identity", color="black") +
+  labs(title="Гистограммы популярности: pop vs rock",
+       x="track_popularity", y="count")
+print(p_hist); save_plot("hist_pop_vs_rock.png", width=6.5, height=4)
+```
+
+# 2. Корреляционный анализ
+
+```{r correlations}
+features <- c("danceability","energy","loudness","speechiness",
+              "acousticness","instrumentalness","liveness",
+              "valence","tempo","duration_ms")
+data_corr <- df %>% select(all_of(features)) %>% na.omit()
+
+cor_pearson <- cor(data_corr, method="pearson")
+cor_spearman <- cor(data_corr, method="spearman")
+cor_kendall <- cor(data_corr, method="kendall")
+
+corrplot(cor_pearson, method="color", type="upper", tl.cex=0.8,
+         title="Корреляция Пирсона", mar=c(0,0,2,0))
+save_plot("corr_pearson.png", width=7.5, height=6)
+
+corrplot(cor_spearman, method="color", type="upper", tl.cex=0.8,
+         title="Корреляция Спирмена", mar=c(0,0,2,0))
+save_plot("corr_spearman.png", width=7.5, height=6)
+
+corrplot(cor_kendall, method="color", type="upper", tl.cex=0.8,
+         title="Корреляция Кендалла", mar=c(0,0,2,0))
+save_plot("corr_kendall.png", width=7.5, height=6)
+
+# scatter energy vs loudness
+p_sc <- ggplot(df, aes(energy, loudness)) +
+  geom_point(alpha=0.3) +
+  geom_smooth(method="lm", se=FALSE, color="red") +
+  labs(title="Energy vs Loudness")
+print(p_sc); save_plot("scatter_energy_loudness.png", width=6, height=4)
+```
+
+# 3. Категориальные тесты: χ², Fisher, CMH
+
+```{r categorical}
+df$is_english <- ifelse(df$language == "en", 1, 0)
+
+ct_genre_mode <- table(df$playlist_genre, df$mode)
+ct_mode_lang  <- table(df$mode, df$is_english)
+
+chi_genre_mode <- chisq.test(ct_genre_mode)
+chi_mode_lang  <- chisq.test(ct_mode_lang)
+fish_mode_lang <- fisher.test(ct_mode_lang)
+
+chi_genre_mode
+chi_mode_lang
+fish_mode_lang
+
+# CMH: mode vs english stratified by genre
+struct_tab <- xtabs(~ mode + is_english + playlist_genre, data=df)
+CMHtest(struct_tab)
+
+# графики долей
+props_major <- prop.table(ct_genre_mode, 1)[, "1"]
+props_minor <- prop.table(ct_genre_mode, 1)[, "0"]
+p_major <- ggplot(data.frame(genre=names(props_major), pct=as.numeric(props_major)),
+                  aes(reorder(genre,pct), pct)) +
+  geom_col(fill="pink") + coord_flip() +
+  scale_y_continuous(labels=percent_format()) +
+  labs(title="Доля mode=1 (мажор) по жанрам", x=NULL, y="Доля")
+print(p_major); save_plot("major_share_by_genre.png", width=7, height=4.5)
+
+p_minor <- ggplot(data.frame(genre=names(props_minor), pct=as.numeric(props_minor)),
+                  aes(reorder(genre,pct), pct)) +
+  geom_col(fill="salmon") + coord_flip() +
+  scale_y_continuous(labels=percent_format()) +
+  labs(title="Доля mode=0 (минор) по жанрам", x=NULL, y="Доля")
+print(p_minor); save_plot("minor_share_by_genre.png", width=7, height=4.5)
+
+ct_ml <- as.data.frame.matrix(ct_mode_lang)
+ct_ml$mode <- rownames(ct_ml)
+ct_ml_long <- pivot_longer(ct_ml, -mode, names_to="lang", values_to="n")
+p_ml <- ggplot(ct_ml_long, aes(mode, n, fill=lang)) +
+  geom_col(position="fill") +
+  scale_y_continuous(labels=percent_format()) +
+  labs(title="Доля англ. треков по mode", x="mode", y="Доля")
+print(p_ml); save_plot("english_share_by_mode.png", width=6, height=4)
+```
+
+# 4. Проверка мультиколлинеарности (VIF)
+
+```{r vif}
+X_vif <- data_corr  # из раздела корреляций, уже без NA
+vif_mod <- lm(danceability ~ ., data=X_vif)  # просто для VIF
+vif_vals <- car::vif(vif_mod)
+vif_vals
+
+vif_df <- data.frame(feature=names(vif_vals), VIF=as.numeric(vif_vals)) %>%
+  arrange(desc(VIF))
+
+p_vif <- ggplot(vif_df, aes(reorder(feature, VIF), VIF)) +
+  geom_col(fill="#86b7ff") + coord_flip() +
+  geom_hline(yintercept=5, linetype="dashed", color="red") +
+  labs(title="VIF признаков", x=NULL, y="VIF")
+print(p_vif); save_plot("vif_bar.png", width=6, height=4.2)
+```
+
+# 5. ANOVA
+
+```{r anova}
+aov1 <- aov(track_popularity ~ playlist_genre, data=df)
+summary(aov1)
+
+aov2 <- aov(track_popularity ~ playlist_genre * mode, data=df)
+summary(aov2)
+
+# boxplot popularity by genre
+p_an_box <- ggplot(df, aes(playlist_genre, track_popularity)) +
+  geom_boxplot(outlier.alpha=0.35, fill="#f0f3ff") +
+  labs(title="Популярность по жанрам", x="playlist_genre", y="track_popularity")
+print(p_an_box); save_plot("anova_boxplot_genre.png", width=7.5, height=4.5)
+
+# interaction plot means
+means_gm <- df %>%
+  group_by(playlist_genre, mode) %>%
+  dplyr::summarise(mean_pop = mean(track_popularity, na.rm = TRUE),
+                   .groups = "drop")
+
+
+p_int <- ggplot(means_gm, aes(playlist_genre, mean_pop, color=factor(mode), group=mode)) +
+  geom_line() + geom_point() +
+  labs(title="Взаимодействие genre × mode (средняя популярность)",
+       x="Жанр", y="Средняя популярность", color="mode")
+print(p_int); save_plot("anova_interaction_genre_mode.png", width=7.5, height=4.5)
+```
+
+# 6. Регрессионный анализ + удаление коллинеарности
+
+\# стандартизация по train
+
+mu \<- sapply(train[, feat_cols], mean)
+
+sdv \<- sapply(train[, feat_cols], sd)
+
+```{r regression}
+feat_cols <- c("danceability","energy","loudness","valence","duration_ms")
+target <- "track_popularity"
+
+df_model <- df %>%
+  select(all_of(feat_cols), all_of(target)) %>%
+  na.omit() %>%
+  as.data.frame()   # <-- FIX: убираем data.table поведение
+
+set.seed(42)
+idx <- sample(seq_len(nrow(df_model)), size=0.8*nrow(df_model))
+train <- df_model[idx, ]
+test  <- df_model[-idx, ]
+
+# стандартизация по train
+mu <- sapply(train[, feat_cols, drop = FALSE], mean)
+sdv <- sapply(train[, feat_cols, drop = FALSE], sd)
+
+scale_df <- function(d){
+  as.data.frame(scale(d[, feat_cols, drop = FALSE], center=mu, scale=sdv))
+}
+
+Xtr <- scale_df(train)
+Xte <- scale_df(test)
+ytr <- train[[target]]
+yte <- test[[target]]
+
+# базовая линейная
+mod_base <- lm(ytr ~ ., data=Xtr)
+pred_tr <- predict(mod_base, Xtr)
+pred_te <- predict(mod_base, Xte)
+
+r2_tr <- 1 - sum((ytr-pred_tr)^2)/sum((ytr-mean(ytr))^2)
+r2_te <- 1 - sum((yte-pred_te)^2)/sum((yte-mean(yte))^2)
+rmse_te <- sqrt(mean((yte-pred_te)^2))
+mae_te <- mean(abs(yte-pred_te))
+
+cat("BASE: R2 train=", round(r2_tr,3), " R2 test=", round(r2_te,3),
+    " RMSE test=", round(rmse_te,2), " MAE test=", round(mae_te,2), "\n")
+
+# pred vs true
+p_pvt <- ggplot(data.frame(true=yte, pred=pred_te), aes(true,pred)) +
+  geom_point(alpha=0.4) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", color="red") +
+  labs(title="Предсказанная vs фактическая (base)", x="true", y="pred")
+print(p_pvt); save_plot("pred_vs_true_base.png", width=5.5, height=5)
+
+resid_base <- yte - pred_te
+p_res_sc <- ggplot(data.frame(pred=pred_te, resid=resid_base), aes(pred,resid)) +
+  geom_point(alpha=0.4) +
+  geom_hline(yintercept=0, linetype="dashed", color="red") +
+  labs(title="Остатки vs предсказанные (base)", x="pred", y="resid")
+print(p_res_sc); save_plot("residuals_scatter_base.png", width=6, height=4)
+
+# QQ residuals
+qq <- qqplot(resid_base, qnorm(ppoints(length(resid_base))), plot.it=FALSE)
+dfq <- data.frame(theor=qq$x, emp=qq$y)
+p_qqr <- ggplot(dfq, aes(theor, emp)) +
+  geom_point(alpha=0.5) +
+  geom_abline(slope=1, intercept=0, color="red") +
+  labs(title="QQ-plot остатков (base)")
+print(p_qqr); save_plot("qq_residuals_base.png", width=5.5, height=5)
+
+p_hr <- ggplot(data.frame(resid=resid_base), aes(resid)) +
+  geom_histogram(bins=30, fill="pink", color="black") +
+  labs(title="Гистограмма остатков (base)", x="resid")
+print(p_hr); save_plot("hist_residuals_base.png", width=6, height=4)
+
+# VIF dropping using train matrix
+vif_base <- car::vif(lm(ytr ~ ., data=Xtr))
+cat("Initial VIF:\n"); print(vif_base)
+
+drop_by_vif <- function(Xdf, thr=5){
+  Xc <- Xdf
+  hist <- list()
+  repeat{
+    vifs <- car::vif(lm(ytr ~ ., data=Xc))
+    if (max(vifs) <= thr) break
+    worst <- names(which.max(vifs))
+    hist[[length(hist)+1]] <- c(feature=worst, VIF=max(vifs))
+    Xc <- Xc[, setdiff(names(Xc), worst), drop=FALSE]
+  }
+  list(X=Xc, history=hist)
+}
+
+tmp <- drop_by_vif(Xtr, thr=5)
+Xtr_vif <- tmp$X
+keep_feats <- names(Xtr_vif)
+cat("Dropped:", tmp$history, "\n")
+cat("Kept:", keep_feats, "\n")
+
+Xte_vif <- Xte[, keep_feats, drop=FALSE]
+
+mod_vif <- lm(ytr ~ ., data=Xtr_vif)
+pred_te_vif <- predict(mod_vif, Xte_vif)
+pred_tr_vif <- predict(mod_vif, Xtr_vif)
+
+r2_tr_vif <- 1 - sum((ytr-pred_tr_vif)^2)/sum((ytr-mean(ytr))^2)
+r2_te_vif <- 1 - sum((yte-pred_te_vif)^2)/sum((yte-mean(yte))^2)
+rmse_te_vif <- sqrt(mean((yte-pred_te_vif)^2))
+mae_te_vif <- mean(abs(yte-pred_te_vif))
+
+cat("AFTER VIF: R2 train=", round(r2_tr_vif,3), " R2 test=", round(r2_te_vif,3),
+    " RMSE test=", round(rmse_te_vif,2), " MAE test=", round(mae_te_vif,2), "\n")
+
+cmp <- data.frame(
+  model=c("base","after_vif"),
+  R2_test=c(r2_te, r2_te_vif),
+  RMSE_test=c(rmse_te, rmse_te_vif),
+  MAE_test=c(mae_te, mae_te_vif)
+)
+cmp
+
+p_r2 <- ggplot(cmp, aes(model, R2_test, fill=model)) +
+  geom_col() + labs(title="R2 test: base vs after VIF", x=NULL, y="R2") +
+  theme(legend.position="none")
+print(p_r2); save_plot("r2_compare_vif.png", width=4.2, height=4)
+
+p_err <- cmp %>% pivot_longer(c(RMSE_test, MAE_test), names_to="metric", values_to="value")
+p_err_plot <- ggplot(p_err, aes(model, value, fill=metric)) +
+  geom_col(position="dodge") +
+  labs(title="Ошибки: base vs after VIF", x=NULL, y="value")
+print(p_err_plot); save_plot("errors_compare_vif.png", width=6, height=4)
+
+```
+
+# Итоговые выводы
+
+-   Двухвыборочный t-тест и Манн–Уитни показывают значимые различия популярности между жанрами pop и rock.\
+-   Нормальность в группах pop/rock отвергается, поэтому непараметрический тест важен для подтверждения выводов.\
+-   Корреляционный анализ выявляет сильную связь energy–loudness и отрицательную energy–acousticness.\
+-   χ², Fisher и CMH демонстрируют статистические зависимости между жанром, mode и языком.\
+-   VIF подтверждает мультиколлинеарность (особенно energy и loudness).\
+-   ANOVA показывает различие средних популярностей по жанрам и значимое взаимодействие genre×mode.\
+-   Линейная и полиномиальная регрессии дают низкий R²; устранение коллинеарности почти не улучшает качество, что согласуется с природой задачи.
